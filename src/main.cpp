@@ -182,6 +182,130 @@ void upload_lights(GLuint shader_program, const std::vector<Light> &lights) {
     }
 }
 
+class DeferredLighting {
+  public:
+    unsigned int deferred_lighting_frame_buffer, position_texture, normal_texture, color_texture, depth_render_buffer;
+
+    draw_info::IndexedVertexPositions deferred_lighting_screen = vertex_geometry::Rectangle().get_ivs();
+
+    ToolboxEngine &tbx_engine;
+    DeferredLighting(ToolboxEngine &tbx_engine) : tbx_engine(tbx_engine) {
+        glGenFramebuffers(1, &deferred_lighting_frame_buffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, deferred_lighting_frame_buffer);
+
+        glGenTextures(1, &position_texture);
+        glBindTexture(GL_TEXTURE_2D, position_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, GL_RGBA,
+                     GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, position_texture, 0);
+
+        glGenTextures(1, &normal_texture);
+        glBindTexture(GL_TEXTURE_2D, normal_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, GL_RGBA,
+                     GL_FLOAT, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, normal_texture, 0);
+
+        glGenTextures(1, &color_texture);
+        glBindTexture(GL_TEXTURE_2D, color_texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, color_texture, 0);
+
+        // - tell OpenGL which color attachments we'll use (of this framebuffer) for rendering
+        unsigned int attachments[3] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+        glDrawBuffers(3, attachments);
+
+        glGenRenderbuffers(1, &depth_render_buffer);
+        glBindRenderbuffer(GL_RENDERBUFFER, depth_render_buffer);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, tbx_engine.window.width_px,
+                              tbx_engine.window.height_px);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depth_render_buffer);
+        // finally check if framebuffer is complete
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            std::cout << "Framebuffer not complete!" << std::endl;
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::POSITION_TEXTURE, 0);
+        tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::NORMAL_TEXTURE, 1);
+        tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::COLOR_TEXTURE, 2);
+    };
+
+    void render(std::vector<draw_info::IVPNColored> objects) {
+        render_position_normal_color_framebuffers(objects);
+        render_lighting();
+        copy_depth_information_into_default_framebuffer();
+    }
+
+    void render_position_normal_color_framebuffers(std::vector<draw_info::IVPNColored> objects) {
+        glBindFramebuffer(GL_FRAMEBUFFER, deferred_lighting_frame_buffer);
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        for (auto &o : objects) {
+            std::vector<unsigned int> ltw_indices(o.xyz_positions.size(), o.id);
+
+            tbx_engine.batcher
+                .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
+                .queue_draw(o.id, o.indices, o.xyz_positions, o.colors, o.normals, ltw_indices);
+
+            tbx_engine.batcher
+                .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
+                .ltw_matrices[o.id] = o.transform.get_transform_matrix();
+        }
+
+        tbx_engine.batcher
+            .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
+            .upload_ltw_matrices();
+        tbx_engine.batcher
+            .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
+            .draw_everything();
+
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    void render_lighting() {
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, position_texture);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, normal_texture);
+        glActiveTexture(GL_TEXTURE2);
+        glBindTexture(GL_TEXTURE_2D, color_texture);
+
+        tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::CAMERA_POSITION,
+                                            tbx_engine.fps_camera.transform.get_translation());
+
+        tbx_engine.batcher.deferred_lighting_shader_batcher.queue_draw(
+            0, deferred_lighting_screen.indices, deferred_lighting_screen.xyz_positions,
+            vertex_geometry::generate_rectangle_texture_coordinates_flipped_vertically());
+
+        tbx_engine.batcher.deferred_lighting_shader_batcher.draw_everything();
+    }
+
+    // copy content of geometry's depth buffer to default framebuffer's depth buffer
+    // the reason we do this is that if we don't then any other draw calls will either end up above or below the
+    // "screen" as its just a quad so we need to keep the depth information to not lose that.
+    void copy_depth_information_into_default_framebuffer() {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, deferred_lighting_frame_buffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // write to default framebuffer
+        // blit to default framebuffer. Note that this may or may not work as the internal formats of both the FBO and
+        // default framebuffer have to match. the internal formats are implementation defined. This works on all of my
+        // systems, but if it doesn't on yours you'll likely have to write to the depth buffer in another shader stage
+        // (or somehow see to match the default framebuffer's internal format with the FBO's internal format).
+        glBlitFramebuffer(0, 0, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, 0,
+                          tbx_engine.window.width_px, tbx_engine.window.height_px, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+};
+
 int main() {
 
     ToolboxEngine tbx_engine(
@@ -269,8 +393,6 @@ int main() {
 
     Transform ball_transform;
 
-    auto deferred_lighting_screen = vertex_geometry::Rectangle().get_ivs();
-
     glm::mat4 identity = glm::mat4(1);
     tbx_engine.shader_cache.set_uniform(
         ShaderType::CWL_V_TRANSFORMATION_UBOS_1024_WITH_COLORED_VERTEX, ShaderUniformVariable::CAMERA_TO_CLIP,
@@ -290,53 +412,7 @@ int main() {
                                         ShaderUniformVariable::ASPECT_RATIO,
                                         glm::vec2(tbx_engine.window.height_px / (float)tbx_engine.window.width_px, 1));
 
-    unsigned int lighting_frame_buffer;
-    glGenFramebuffers(1, &lighting_frame_buffer);
-    glBindFramebuffer(GL_FRAMEBUFFER, lighting_frame_buffer);
-
-    unsigned int position_texture, normal_texture, color_texture;
-
-    glGenTextures(1, &position_texture);
-    glBindTexture(GL_TEXTURE_2D, position_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, GL_RGBA,
-                 GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, position_texture, 0);
-
-    glGenTextures(1, &normal_texture);
-    glBindTexture(GL_TEXTURE_2D, normal_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, GL_RGBA,
-                 GL_FLOAT, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_TEXTURE_2D, normal_texture, 0);
-
-    glGenTextures(1, &color_texture);
-    glBindTexture(GL_TEXTURE_2D, color_texture);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, GL_RGBA,
-                 GL_UNSIGNED_BYTE, NULL);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, GL_TEXTURE_2D, color_texture, 0);
-
-    // - tell OpenGL which color attachments we'll use (of this framebuffer) for rendering
-    unsigned int attachments[3] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
-    glDrawBuffers(3, attachments);
-
-    unsigned int rboDepth;
-    glGenRenderbuffers(1, &rboDepth);
-    glBindRenderbuffer(GL_RENDERBUFFER, rboDepth);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT, tbx_engine.window.width_px, tbx_engine.window.height_px);
-    glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rboDepth);
-    // finally check if framebuffer is complete
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-        std::cout << "Framebuffer not complete!" << std::endl;
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::POSITION_TEXTURE, 0);
-    tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::NORMAL_TEXTURE, 1);
-    tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::COLOR_TEXTURE, 2);
+    DeferredLighting deferred_lighting(tbx_engine);
 
     // RateLimitedConsoleLogger tick_logger(1);
     ConsoleLogger tick_logger;
@@ -361,63 +437,7 @@ int main() {
             ShaderType::CWL_V_TRANSFORMATION_UBOS_1024_WITH_COLORED_VERTEX_DEFERED_LIGHTING_FRAMEBUFFERS,
             ShaderUniformVariable::WORLD_TO_CAMERA, tbx_engine.fps_camera.get_view_matrix());
 
-        glBindFramebuffer(GL_FRAMEBUFFER, lighting_frame_buffer);
-        {
-
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-            for (auto &o : objects) {
-                std::vector<unsigned int> ltw_indices(o.xyz_positions.size(), o.id);
-
-                tbx_engine.batcher
-                    .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
-                    .queue_draw(o.id, o.indices, o.xyz_positions, o.colors, o.normals, ltw_indices);
-
-                tbx_engine.batcher
-                    .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
-                    .ltw_matrices[o.id] = o.transform.get_transform_matrix();
-            }
-
-            tbx_engine.batcher
-                .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
-                .upload_ltw_matrices();
-            tbx_engine.batcher
-                .cwl_v_transformation_ubos_1024_with_colored_vertex_defered_lighting_framebuffers_shader_batcher
-                .draw_everything();
-        }
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-        {
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, position_texture);
-            glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, normal_texture);
-            glActiveTexture(GL_TEXTURE2);
-            glBindTexture(GL_TEXTURE_2D, color_texture);
-
-            tbx_engine.shader_cache.set_uniform(ShaderType::DEFERRED_LIGHTING, ShaderUniformVariable::CAMERA_POSITION,
-                                                tbx_engine.fps_camera.transform.get_translation());
-
-            tbx_engine.batcher.deferred_lighting_shader_batcher.queue_draw(
-                0, deferred_lighting_screen.indices, deferred_lighting_screen.vertices,
-                vertex_geometry::generate_rectangle_texture_coordinates_flipped_vertically());
-
-            tbx_engine.batcher.deferred_lighting_shader_batcher.draw_everything();
-        }
-
-        // 2.5. copy content of geometry's depth buffer to default framebuffer's depth buffer
-        // ----------------------------------------------------------------------------------
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, lighting_frame_buffer);
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0); // write to default framebuffer
-        // blit to default framebuffer. Note that this may or may not work as the internal formats of both the FBO and
-        // default framebuffer have to match. the internal formats are implementation defined. This works on all of my
-        // systems, but if it doesn't on yours you'll likely have to write to the depth buffer in another shader stage
-        // (or somehow see to match the default framebuffer's internal format with the FBO's internal format).
-        glBlitFramebuffer(0, 0, tbx_engine.window.width_px, tbx_engine.window.height_px, 0, 0,
-                          tbx_engine.window.width_px, tbx_engine.window.height_px, GL_DEPTH_BUFFER_BIT, GL_NEAREST);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        deferred_lighting.render(objects);
 
         for (auto &lm : light_meshes) {
             // exists.
