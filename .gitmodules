@@ -106,3 +106,6 @@
 [submodule "src/system_logic/toolbox_engine"]
 	path = src/system_logic/toolbox_engine
 	url = git@github.com:cpp-toolbox/toolbox_engine.git
+[submodule "src/graphics/deferred_lighting"]
+	path = src/graphics/deferred_lighting
+	url = git@github.com:cpp-toolbox/deferred_lighting.git
